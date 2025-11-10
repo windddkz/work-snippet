@@ -679,32 +679,19 @@ export default {
 			}
 		}
 
-		// 构造请求参数
+		const new_headers = new Headers(request.headers);
+		new_headers.set('Host', hub_host);
 		let parameter = {
-			headers: {
-				'Host': hub_host,
-				'User-Agent': getReqHeader("User-Agent"),
-				'Accept': getReqHeader("Accept"),
-				'Accept-Language': getReqHeader("Accept-Language"),
-				'Accept-Encoding': getReqHeader("Accept-Encoding"),
-				'Connection': 'keep-alive',
-				'Cache-Control': 'max-age=0'
-			},
-			cacheTtl: 3600 // 缓存时间
+			headers: new_headers,
+			cacheTtl: 3600
 		};
-
-		// 添加Authorization头
-		if (request.headers.has("Authorization")) {
-			parameter.headers.Authorization = getReqHeader("Authorization");
-		}
-
-		// 添加可能存在字段X-Amz-Content-Sha256
-		if (request.headers.has("X-Amz-Content-Sha256")) {
-			parameter.headers['X-Amz-Content-Sha256'] = getReqHeader("X-Amz-Content-Sha256");
-		}
-
-		// 发起请求并处理响应
-		let original_response = await fetchUpstream(new Request(url, request), parameter);
+		const upstreamRequest = new Request(url, {
+			method: request.method,
+			headers: parameter.headers,
+			body: request.body,
+			redirect: 'manual'
+		});
+		let original_response = await fetchUpstream(upstreamRequest);
 		let original_response_clone = original_response.clone();
 		let original_text = original_response_clone.body;
 		let response_headers = original_response.headers;

@@ -6,7 +6,10 @@ let 屏蔽爬虫UA = ['netcraft'];
 // --- NAT64 功能配置 ---
 const nat64Prefix = '2602:fc59:b0:64::';
 const directHosts = [
-	'whitelist.com',
+	'registry-1.docker.io',
+	'auth.docker.io',
+	'index.docker.io',
+	'hub.docker.com',
 	'1.1.1.1',
 ];
 

@@ -6,20 +6,21 @@ let 屏蔽爬虫UA = ['netcraft'];
 // --- NAT64 功能配置 ---
 const nat64Prefix = '2602:fc59:b0:64::';
 const directHosts = [
-	'registry-1.docker.io',
-	'auth.docker.io',
-	'index.docker.io',
-	'hub.docker.com',
+	'whitelist.com',
 	'1.1.1.1',
 ];
 
 // --- 核心功能函数 ---
-
 function routeByHosts(host) {
 	const routes = {
-		"quay": "quay.io", "gcr": "gcr.io", "k8s-gcr": "k8s.gcr.io",
-		"k8s": "registry.k8s.io", "ghcr": "ghcr.io", "cloudsmith": "docker.cloudsmith.io",
-		"nvcr": "nvcr.io", "test": "registry-1.docker.io",
+		"quay": "quay.io",
+		"gcr": "gcr.io",
+		"k8s-gcr": "k8s.gcr.io",
+		"k8s": "registry.k8s.io",
+		"ghcr": "ghcr.io",
+		"cloudsmith": "docker.cloudsmith.io",
+		"nvcr": "nvcr.io",
+		"test": "registry-1.docker.io",
 	};
 	if (host in routes) return [routes[host], false];
 	return [hub_host, true];
@@ -57,7 +58,6 @@ export default {
 		url.hostname = hub_host;
 
 		if (屏蔽爬虫UA.some(fxxk => userAgent.includes(fxxk)) && 屏蔽爬虫UA.length > 0) {
-			console.log(`[Access Denied] 检测到被屏蔽的UA: ${userAgent}`);
 			return new Response(await nginx(), { headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 		}
 
@@ -88,7 +88,6 @@ export default {
 			url.pathname = '/v2/library/' + url.pathname.split('/v2/')[1];
 		}
 		
-		// [FIXED] 构造一个清晰的 RequestInit 对象 (parameter)
 		const parameter = {
 			method: request.method,
 			headers: new Headers(request.headers),
@@ -98,7 +97,6 @@ export default {
 		parameter.headers.set('Host', hub_host);
 		
 		if (hub_host === 'registry-1.docker.io' && url.pathname.startsWith('/v2/') && (url.pathname.includes('/manifests/') || url.pathname.includes('/blobs/') || url.pathname.endsWith('/tags/list'))) {
-			console.log(`[Auth] 检测到 Docker Hub 需要认证的 /v2/ 请求: ${url.pathname}`);
 			let repo = '';
 			const v2Match = url.pathname.match(/^\/v2\/(.+?)(?:\/(manifests|blobs|tags)\/)/);
 			if (v2Match) repo = v2Match[1];
@@ -106,19 +104,14 @@ export default {
 			
 			if (repo) {
 				const tokenUrl = `${auth_url}/token?service=registry.docker.io&scope=repository:${repo}:pull`;
-				console.log(`[Auth] 正在为仓库 '${repo}' 从 ${auth_url} 获取Token...`);
 				const tokenRes = await fetchUpstream(tokenUrl);
 				if (tokenRes.ok) {
 					const tokenData = await tokenRes.json();
 					parameter.headers.set('Authorization', `Bearer ${tokenData.token}`);
-					console.log(`[Auth] Token获取成功，将带Token继续请求`);
-				} else {
-					console.error(`[Auth] Token获取失败，状态码: ${tokenRes.status}`);
 				}
 			}
 		}
 
-		// [FIXED] 传递 url 和 parameter 对象，而不是一个 Request 对象
 		let original_response = await fetchUpstream(url.toString(), parameter);
 		
 		let new_response_headers = new Headers(original_response.headers);
@@ -132,20 +125,19 @@ export default {
 				const originalRealmHost = realmMatch[1].split('/')[0];
 				const modifiedAuthHeader = authHeader.replace(originalRealmHost, workers_hostname);
 				new_response_headers.set("Www-Authenticate", modifiedAuthHeader);
-				console.log(`[Header Modify] 重写 'Www-Authenticate' 头: ${authHeader} -> ${modifiedAuthHeader}`);
 			}
 		}
 
 		if (new_response_headers.get("Location")) {
 			const location = new_response_headers.get("Location");
-			return httpHandler(request, location);
+			console.log(`[Redirect] 发现重定向，目标: ${location}，上游主机: ${hub_host}`);
+			// [FIXED] 将上游主机 (hub_host) 传递给 httpHandler 以处理相对路径
+			return httpHandler(request, location, hub_host);
 		}
 
 		new_response_headers.set('access-control-allow-origin', '*');
 		new_response_headers.set('access-control-expose-headers', '*');
 		new_response_headers.delete('content-security-policy');
-		new_response_headers.delete('content-security-policy-report-only');
-		new_response_headers.delete('clear-site-data');
 
 		return new Response(original_response.body, {
 			status: original_response.status,
@@ -154,19 +146,23 @@ export default {
 	}
 };
 
-function httpHandler(req, location) {
-	console.log(`[Redirect] 正在跟随重定向到: ${location}`);
+// [FIXED] httpHandler 现在接受 baseHost 参数
+function httpHandler(req, location, baseHost) {
+	// [FIXED] 使用双参数URL构造函数来正确处理绝对和相对路径
+	const redirectUrl = new URL(location, `https://${baseHost}`);
+	console.log(`[Redirect] 解析后的绝对重定向URL: ${redirectUrl.href}`);
+
 	const reqInit = {
 		method: req.method,
 		headers: req.headers,
-		redirect: 'follow',
-		body: req.body
+		redirect: 'follow', // 跟随重定向
 	};
-	return fetchUpstream(location, reqInit);
+	
+	// 对最终解析出的URL应用我们的代理逻辑
+	return fetchUpstream(redirectUrl.href, reqInit);
 }
 
 // --- NAT64 功能函数 ---
-
 async function fetchUpstream(url, options) {
     const urlObj = new URL(url);
     const hostname = urlObj.hostname;
@@ -180,13 +176,11 @@ async function fetchUpstream(url, options) {
     }
 }
 
-// [FIXED] 函数签名和内部逻辑都已修正
 async function fetchWithNat64(url, options) {
     const urlObj = new URL(url);
     const hostname = urlObj.hostname;
 
     console.log(`[NAT64 Fetch] 开始为 ${hostname} 执行NAT64请求`);
-	// 添加日志以确认 Authorization 头是否存在
 	if (options && options.headers && new Headers(options.headers).has('Authorization')) {
 		console.log('[NAT64 Fetch] 检测到 Authorization 头，将一同转发。');
 	}
@@ -194,14 +188,9 @@ async function fetchWithNat64(url, options) {
     try {
         const ipv6Address = await getIPv6ProxyAddress(hostname);
         
-        // 创建 options 的副本以安全地修改
         const newOptions = { ...options };
-		
-		// 确保 cf 对象存在
 		newOptions.cf = { ...newOptions.cf };
         newOptions.cf.resolveOverride = ipv6Address.replace(/\[|\]/g, '');
-
-        // 确保 headers 对象是 Headers 实例
         newOptions.headers = new Headers(newOptions.headers);
         newOptions.headers.set('Host', hostname);
 
@@ -241,7 +230,6 @@ async function getIPv6ProxyAddress(domain) {
         const ipv4 = await getIPv4Address(domain);
         return convertToNAT64IPv6(ipv4);
     } catch (err) {
-        console.error(`[NAT64] 获取 ${domain} 的NAT64地址失败: ${err.message}`);
         throw err;
     }
 }

@@ -25,8 +25,16 @@ function routeByHosts(host) {
 		"ghcr": "ghcr.io",
 		"cloudsmith": "docker.cloudsmith.io",
 		"nvcr": "nvcr.io",
-
+		"quay-nat64": "quay.io",
+		"gcr-nat64": "gcr.io",
+		"k8s-gcr-nat64": "k8s.gcr.io",
+		"k8s-nat64": "registry.k8s.io",
+		"ghcr-nat64": "ghcr.io",
+		"cloudsmith-nat64": "docker.cloudsmith.io",
+		"nvcr-nat64": "nvcr.io",
 		// 测试环境
+		"dp": "registry-1.docker.io",
+		"dp-nat64": "registry-1.docker.io",
 		"test": "registry-1.docker.io",
 	};
 
@@ -418,17 +426,24 @@ async function searchInterface() {
 }
 
 // --- NAT64 功能及辅助函数 ---
-async function fetchUpstream(urlOrRequest, options) {
+async function fetchUpstream(urlOrRequest, options, workerHostname) {
     const requestUrl = typeof urlOrRequest === 'string' ? urlOrRequest : urlOrRequest.url;
     const urlObj = new URL(requestUrl);
     const hostname = urlObj.hostname;
 
+    // 无论NAT64开关是否开启，白名单域名始终直连
     if (directHosts.includes(hostname)) {
         console.log(`[FetchUpstream] 主机 ${hostname} 在直连名单中，将使用直接连接。`);
         return fetch(urlOrRequest, options);
-    } else {
-        console.log(`[FetchUpstream] 主机 ${hostname} 不在直连名单中，将默认使用NAT64连接。`);
+    }
+
+    // 检查worker主机名是否包含'nat64'以激活NAT64功能
+    if (workerHostname && workerHostname.includes('nat64')) {
+        console.log(`[FetchUpstream] NAT64已激活。主机 ${hostname} 不在直连名单中，将使用NAT64连接。`);
         return fetchWithNat64(urlOrRequest, options);
+    } else {
+        console.log(`[FetchUpstream] NAT64未激活或不满足条件。主机 ${hostname} 将使用直接连接。`);
+        return fetch(urlOrRequest, options);
     }
 }
 
@@ -509,7 +524,7 @@ export default {
 		const userAgent = userAgentHeader ? userAgentHeader.toLowerCase() : "null";
 		if (env.UA) 屏蔽爬虫UA = 屏蔽爬虫UA.concat(await ADD(env.UA));
 		const workers_url = `https://${url.hostname}`;
-    const workers_hostname = url.hostname;
+		const workers_hostname = url.hostname;
 
 		// 获取请求参数中的 ns
 		const ns = url.searchParams.get('ns');
@@ -553,7 +568,7 @@ export default {
 								'Content-Type': 'text/html; charset=UTF-8',
 							},
 						});
-					} else return fetchUpstream(new Request(env.URL, request));
+					} else return fetchUpstream(new Request(env.URL, request), undefined, workers_hostname);
 				} else	{
 					if (fakePage) return new Response(await searchInterface(), {
 						headers: {
@@ -573,7 +588,7 @@ export default {
 					url.searchParams.set('q', search.replace('library/', ''));
 				}
 				const newRequest = new Request(url, request);
-				return fetchUpstream(newRequest);
+				return fetchUpstream(newRequest, undefined, workers_hostname);
 			}
 		}
 
@@ -598,7 +613,7 @@ export default {
 				}
 			};
 			let token_url = dockerio_auth_url + url.pathname + url.search;
-			return fetchUpstream(new Request(token_url, request), token_parameter);
+			return fetchUpstream(new Request(token_url, request), token_parameter, workers_hostname);
 		}
 
 		// 修改 /v2/ 请求路径
@@ -636,7 +651,7 @@ export default {
 						'Connection': 'keep-alive',
 						'Cache-Control': 'max-age=0'
 					}
-				});
+				}, workers_hostname);
 				const tokenData = await tokenRes.json();
 				const token = tokenData.token;
 				let parameter = {
@@ -655,7 +670,7 @@ export default {
 				if (request.headers.has("X-Amz-Content-Sha256")) {
 					parameter.headers['X-Amz-Content-Sha256'] = getReqHeader("X-Amz-Content-Sha256");
 				}
-				let original_response = await fetchUpstream(new Request(url, request), parameter);
+				let original_response = await fetchUpstream(new Request(url, request), parameter, workers_hostname);
 				let original_response_clone = original_response.clone();
 				let original_text = original_response_clone.body;
 				let response_headers = original_response.headers;
@@ -669,7 +684,7 @@ export default {
 				if (new_response_headers.get("Location")) {
 					const location = new_response_headers.get("Location");
 					console.info(`Found redirection location, redirecting to ${location}`);
-					return httpHandler(request, location, hub_host);
+					return httpHandler(request, location, hub_host, workers_hostname);
 				}
 				let response = new Response(original_text, {
 					status,
@@ -691,7 +706,7 @@ export default {
 			body: request.body,
 			redirect: 'manual'
 		});
-		let original_response = await fetchUpstream(upstreamRequest);
+		let original_response = await fetchUpstream(upstreamRequest, undefined, workers_hostname);
 		let original_response_clone = original_response.clone();
 		let original_text = original_response_clone.body;
 		let response_headers = original_response.headers;
@@ -715,7 +730,7 @@ export default {
 		if (new_response_headers.get("Location")) {
 			const location = new_response_headers.get("Location");
 			console.info(`Found redirection location, redirecting to ${location}`);
-			return httpHandler(request, location, hub_host);
+			return httpHandler(request, location, hub_host, workers_hostname);
 		}
 
 		// 返回修改后的响应
@@ -732,8 +747,9 @@ export default {
  * @param {Request} req 请求对象
  * @param {string} pathname 请求路径
  * @param {string} baseHost 基地址
+ * @param {string} workerHostname worker主机名
  */
-function httpHandler(req, pathname, baseHost) {
+function httpHandler(req, pathname, baseHost, workerHostname) {
 	const reqHdrRaw = req.headers;
 
 	// 处理预检请求
@@ -762,7 +778,7 @@ function httpHandler(req, pathname, baseHost) {
 		redirect: 'follow',
 		body: req.body
 	};
-	return proxy(urlObj, reqInit, rawLen);
+	return proxy(urlObj, reqInit, rawLen, workerHostname);
 }
 
 /**
@@ -770,9 +786,10 @@ function httpHandler(req, pathname, baseHost) {
  * @param {URL} urlObj URL对象
  * @param {RequestInit} reqInit 请求初始化对象
  * @param {string} rawLen 原始长度
+ * @param {string} workerHostname worker主机名
  */
-async function proxy(urlObj, reqInit, rawLen) {
-	const res = await fetchUpstream(urlObj.href, reqInit);
+async function proxy(urlObj, reqInit, rawLen, workerHostname) {
+	const res = await fetchUpstream(urlObj.href, reqInit, workerHostname);
 	const resHdrOld = res.headers;
 	const resHdrNew = new Headers(resHdrOld);
 

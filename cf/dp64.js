@@ -8,7 +8,16 @@ const dockerio_auth_url = 'https://auth.docker.io';
 let 屏蔽爬虫UA = ['netcraft'];
 
 // --- NAT64 功能配置 ---
-const nat64Prefix = '2602:fc59:b0:64::';
+const nat64Prefixes = [
+	'2602:fc59:b0:64::',      // ZTVI (Fremont)
+	'2001:67c:2960:6464::',  // level66.services
+	'2a00:1098:2b::',        // Kasper Dupont (DE, UK, FI)
+	'2a00:1098:2c:1::',      // Kasper Dupont (DE, UK, FI)
+	'2001:67c:2b0:db32:0:1::',// Trex
+	'2602:fc59:11:64::',      // ZTVI (Chicago)
+	'2a01:4f8:c2c:123f:64::', // Kasper Dupont (DE, UK, FI)
+	'2a01:4f9:c010:3f02:64::',// Kasper Dupont (DE, UK, FI)
+];
 const directHosts = [
 	'1.1.1.1',
 ];
@@ -431,13 +440,11 @@ async function fetchUpstream(urlOrRequest, options, workerHostname) {
     const urlObj = new URL(requestUrl);
     const hostname = urlObj.hostname;
 
-    // 无论NAT64开关是否开启，白名单域名始终直连
     if (directHosts.includes(hostname)) {
         console.log(`[FetchUpstream] 主机 ${hostname} 在直连名单中，将使用直接连接。`);
         return fetch(urlOrRequest, options);
     }
 
-    // 检查worker主机名是否包含'nat64'以激活NAT64功能
     if (workerHostname && workerHostname.includes('nat64')) {
         console.log(`[FetchUpstream] NAT64已激活。主机 ${hostname} 不在直连名单中，将使用NAT64连接。`);
         return fetchWithNat64(urlOrRequest, options);
@@ -448,40 +455,57 @@ async function fetchUpstream(urlOrRequest, options, workerHostname) {
 }
 
 async function fetchWithNat64(urlOrRequest, options) {
-    const requestUrl = typeof urlOrRequest === 'string' ? urlOrRequest : urlOrRequest.url;
-    const urlObj = new URL(requestUrl);
-    const hostname = urlObj.hostname;
+	const requestUrl = typeof urlOrRequest === 'string' ? urlOrRequest : urlOrRequest.url;
+	const urlObj = new URL(requestUrl);
+	const hostname = urlObj.hostname;
 
-    console.log(`[NAT64 Fetch] 开始为 ${hostname} 执行NAT64请求`);
-    const originalHeaders = (typeof urlOrRequest === 'string' ? options?.headers : urlOrRequest.headers) || {};
+	console.log(`[NAT64 Fetch] 开始为 ${hostname} 执行NAT64轮询请求`);
+	const originalHeaders = (typeof urlOrRequest === 'string' ? options?.headers : urlOrRequest.headers) || {};
 	if (new Headers(originalHeaders).has('Authorization')) {
 		console.log('[NAT64 Fetch] 检测到 Authorization 头，将一同转发。');
 	}
 
-    try {
-        const ipv6Address = await getIPv6ProxyAddress(hostname);
-        
-        const newOptions = { ...options };
-		newOptions.cf = { ...(options?.cf || {}) };
-        newOptions.cf.resolveOverride = ipv6Address.replace(/\[|\]/g, '');
+	let ipv4;
+	try {
+		ipv4 = await getIPv4Address(hostname);
+	} catch (error) {
+		console.error(`[NAT64 Fetch] 获取 ${hostname} 的IPv4地址失败: ${error.message}`);
+		return new Response(`Failed to get IPv4 for ${hostname}: ${error.message}`, { status: 502 });
+	}
 
-        // 融合原始请求头和options中的headers，并设置Host
-        const newHeaders = new Headers(originalHeaders);
-        if (options?.headers) {
-            new Headers(options.headers).forEach((value, key) => {
-                newHeaders.set(key, value);
-            });
-        }
-        newHeaders.set('Host', hostname);
-        newOptions.headers = newHeaders;
+	for (const prefix of nat64Prefixes) {
+		try {
+			const ipv6Address = convertToNAT64IPv6(ipv4, prefix);
 
-        console.log(`[NAT64 Fetch] 将请求 ${requestUrl} (Host: ${hostname}) 解析到IPv6地址: ${ipv6Address}`);
-        return fetch(urlOrRequest, newOptions);
+			const newOptions = { ...options };
+			newOptions.cf = { ...(options?.cf || {}) };
+			newOptions.cf.resolveOverride = ipv6Address.replace(/\[|\]/g, '');
 
-    } catch (error) {
-        console.error(`[NAT64 Fetch] NAT64请求失败: ${error.message}`);
-        return new Response(`NAT64 connection failed for ${hostname}: ${error.message}`, { status: 502 });
-    }
+			const newHeaders = new Headers(originalHeaders);
+			if (options?.headers) {
+				new Headers(options.headers).forEach((value, key) => {
+					newHeaders.set(key, value);
+				});
+			}
+			newHeaders.set('Host', hostname);
+			newOptions.headers = newHeaders;
+
+			console.log(`[NAT64 Fetch] 尝试使用前缀 ${prefix} 请求 ${requestUrl} (Host: ${hostname}) -> ${ipv6Address}`);
+			const response = await fetch(urlOrRequest, newOptions);
+
+			if (response.status < 500) {
+				console.log(`[NAT64 Fetch] 使用前缀 ${prefix} 成功获取响应，状态码: ${response.status}`);
+				return response;
+			}
+			console.warn(`[NAT64 Fetch] 使用前缀 ${prefix} 失败，状态码: ${response.status}。尝试下一个...`);
+
+		} catch (error) {
+			console.error(`[NAT64 Fetch] 使用前缀 ${prefix} 请求时发生网络错误: ${error.message}。尝试下一个...`);
+		}
+	}
+
+	console.error(`[NAT64 Fetch] 所有NAT64前缀均尝试失败: ${hostname}`);
+	return new Response(`All NAT64 providers failed for ${hostname}`, { status: 502 });
 }
 
 async function getIPv4Address(domain) {
@@ -497,22 +521,13 @@ async function getIPv4Address(domain) {
     throw new Error(`未能找到 ${domain} 的A记录`);
 }
 
-function convertToNAT64IPv6(ipv4Address) {
+function convertToNAT64IPv6(ipv4Address, nat64Prefix) {
 	const parts = ipv4Address.split('.');
 	if (parts.length !== 4 || parts.some(part => isNaN(part) || part < 0 || part > 255)) {
 		throw new Error(`无效的IPv4地址: ${ipv4Address}`);
 	}
 	const hex = parts.map(part => parseInt(part, 10).toString(16).padStart(2, '0'));
 	return `[${nat64Prefix}${hex[0]}${hex[1]}:${hex[2]}${hex[3]}]`;
-}
-
-async function getIPv6ProxyAddress(domain) {
-    try {
-        const ipv4 = await getIPv4Address(domain);
-        return convertToNAT64IPv6(ipv4);
-    } catch (err) {
-        throw err;
-    }
 }
 
 export default {
@@ -652,6 +667,11 @@ export default {
 						'Cache-Control': 'max-age=0'
 					}
 				}, workers_hostname);
+
+				if (!tokenRes.ok) {
+					return tokenRes;
+				}
+
 				const tokenData = await tokenRes.json();
 				const token = tokenData.token;
 				let parameter = {

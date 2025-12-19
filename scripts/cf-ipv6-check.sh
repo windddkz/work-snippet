@@ -1,214 +1,130 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ==================== 配置参数 ====================
-# 基本配置
+# ==================== 配置区域 ====================
+# 1. 目标检测配置
 DOMAIN="${DOMAIN:-MY-DOMAIN.COM}"
 CHECK_URL="${CHECK_URL:-https://$DOMAIN/}"
-PROXY_TYPE="${PROXY_TYPE:-socks5}"          # http|socks5
-PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
-PROXY_PORT="${PROXY_PORT:-1082}"
+
+# 2. 根因排查配置
+# IPv4 公网检测 (百度)
+TEST_IPV4_URL="${TEST_IPV4_URL:-https://www.baidu.com}"
+# IPv6 公网检测 (阿里DNS IPv6 Ping)
+TEST_IPV6_ADDR="${TEST_IPV6_ADDR:-2400:3200::1}"
+# 本地源站检测 (留空则跳过，用于判断Docker服务状态)
+LOCAL_SOURCE_URL="${LOCAL_SOURCE_URL:-http://127.0.0.1:8300}"
+
+# 3. 代理配置
+ENABLE_PROXY="${ENABLE_PROXY:-false}"
+PROXY_TYPE="${PROXY_TYPE:-socks5}"
+PROXY_HOST="${PROXY_HOST:-192.168.100.3}"
+PROXY_PORT="${PROXY_PORT:-1080}"
+
+# 4. 运行策略
+CHECK_TIMEOUT="${CHECK_TIMEOUT:-10}"       # 单次连接超时
+CHECK_INTERVAL="${CHECK_INTERVAL:-60}"     # 每次检查间隔
+MAX_RETRY_COUNT="${MAX_RETRY_COUNT:-10}"   # 目标检测最大重试次数
+RECOVERY_WAIT_TIME="${RECOVERY_WAIT_TIME:-300}" # 网络重启后等待时间
+
+# 5. TrueNAS/Docker 环境配置
 NETWORK_INTERFACE="${NETWORK_INTERFACE:-br0}"
+RESTART_METHOD="${RESTART_METHOD:-truenas}" # truenas|systemd-networkd|raw|dhclient
 
-# 网络重启方式配置
-RESTART_METHOD="${RESTART_METHOD:-truenas}"  # truenas|systemd-networkd|raw|dhclient
-
-# DDNS 更新配置
-ENABLE_DDNS_RESTART="${ENABLE_DDNS_RESTART:-true}"
-DDNS_COMPOSE_DIR="${DDNS_COMPOSE_DIR:-/root/docker-data/ddns-updater}"
-DDNS_COMPOSE_SERVICE="${DDNS_COMPOSE_SERVICE:-ddns-updater}"
-
-# 检测参数
-CHECK_TIMEOUT="${CHECK_TIMEOUT:-15}"
-CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
-MAX_RETRY_COUNT="${MAX_RETRY_COUNT:-3}"
-RECOVERY_WAIT_TIME="${RECOVERY_WAIT_TIME:-120}"
-
-# 高级配置
-ENABLE_EXPONENTIAL_BACKOFF="${ENABLE_EXPONENTIAL_BACKOFF:-true}"
-MAX_BACKOFF_INTERVAL="${MAX_BACKOFF_INTERVAL:-300}"
-LOG_MAX_SIZE="${LOG_MAX_SIZE:-10485760}"   # 10MB
-ENABLE_SYSLOG="${ENABLE_SYSLOG:-false}"
-
-# 文件路径
+# 6. 日志与锁
 LOG_FILE="${LOG_FILE:-/var/log/cloudflare_monitor.log}"
 LOCK_FILE="${LOCK_FILE:-/var/run/cloudflare_monitor.lock}"
-CONFIG_FILE="${CONFIG_FILE:-/etc/cloudflare-monitor.conf}"
+# ==================== 配置结束 ====================
 
-# 内部变量
-SCRIPT_PID=$$
-CURRENT_BACKOFF_INTERVAL=$CHECK_INTERVAL
-CONSECUTIVE_FAILURES=0
-
-# ==================== 配置文件加载 ====================
-load_config() {
-    if [[ -f "$CONFIG_FILE" ]]; then
-        log_info "加载配置文件: $CONFIG_FILE"
-        # shellcheck source=/dev/null
-        source "$CONFIG_FILE"
-    fi
-}
-
-# ==================== 错误处理 ====================
-error_handler() {
-    local line_no=$1
-    local error_code=$2
-    log_error "脚本在第 $line_no 行发生错误 (退出码: $error_code)"
-    cleanup
-    exit "$error_code"
-}
-
-trap 'error_handler ${LINENO} $?' ERR
-trap cleanup SIGTERM SIGINT
-
-# ==================== 日志系统 ====================
+# 日志函数
 log_message() {
     local level="$1"
     local message="$2"
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    local log_line="[$timestamp] [$$] [$level] $message"
+    local log_line="[$timestamp] [PID:$$] [$level] $message"
+    # 同时输出到标准输出(SSH可见)和日志文件(持久化)
     echo "$log_line"
-    if [[ "$ENABLE_SYSLOG" == "true" ]]; then
-        logger -t "cloudflare-monitor" -p "daemon.$level" "$message"
-    fi
     if [[ -n "$LOG_FILE" ]]; then
-        rotate_log_if_needed
         echo "$log_line" >> "$LOG_FILE"
     fi
 }
+log_info() { log_message "INFO" "$1"; }
+log_warn() { log_message "WARN" "$1"; }
+log_error() { log_message "ERROR" "$1"; }
+log_success() { log_message "SUCCESS" "$1"; }
 
-rotate_log_if_needed() {
-    if [[ -f "$LOG_FILE" ]] && [[ $(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) -gt $LOG_MAX_SIZE ]]; then
-        mv "$LOG_FILE" "${LOG_FILE}.old"
-        log_info "日志文件已轮换"
-    fi
-}
-
-log_info() { log_message "info" "$1"; }
-log_warn() { log_message "warning" "$1"; }
-log_error() { log_message "error" "$1"; }
-log_success() { log_message "notice" "$1"; }
-
-# ==================== 锁机制 ====================
+# 锁机制
 acquire_lock() {
     exec 200>"$LOCK_FILE"
-    if ! flock -n 200; then echo "脚本已在运行，退出"; exit 1; fi
+    if ! flock -n 200; then
+        echo "Script is already running (PID in lockfile)."
+        exit 0
+    fi
     echo $$ >&200
 }
 
-# ==================== 初始化检查 ====================
-init_check() {
-    log_info "========== 脚本启动 (版本 2.2 - DDNS & Curl Fix) =========="
-    log_info "检测URL: $CHECK_URL"; log_info "代理类型: $PROXY_TYPE"; log_info "代理地址: $PROXY_HOST:$PROXY_PORT"; log_info "网络接口: $NETWORK_INTERFACE"; log_info "重启方式: $RESTART_METHOD"
-    if [[ "$ENABLE_DDNS_RESTART" == "true" ]]; then log_info "DDNS重启已启用: $DDNS_COMPOSE_DIR"; fi
+cleanup() {
+    rm -f "$LOCK_FILE" 2>/dev/null
+}
+trap cleanup EXIT
 
-    if [[ $EUID -ne 0 ]]; then log_error "此脚本需要root权限运行"; exit 1; fi
+# ==================== 核心检测函数 ====================
 
-    local required_commands=("curl" "ip"); if [[ "$ENABLE_DDNS_RESTART" == "true" ]]; then required_commands+=("docker"); fi
-    case "$RESTART_METHOD" in
-        truenas) required_commands+=("midclt") ;;
-        systemd-networkd) required_commands+=("systemctl") ;;
-        dhclient) required_commands+=("dhclient") ;;
-    esac
-
-    for cmd in "${required_commands[@]}"; do
-        if ! command -v "$cmd" &> /dev/null; then log_error "缺少必要命令: $cmd"; exit 1; fi
-    done
-    if ! ip link show "$NETWORK_INTERFACE" &> /dev/null; then log_error "网络接口 $NETWORK_INTERFACE 不存在"; exit 1; fi
-    if [[ "$ENABLE_DDNS_RESTART" == "true" ]] && [[ ! -f "$DDNS_COMPOSE_DIR/docker-compose.yml" ]]; then
-        log_warn "DDNS重启已启用，但找不到docker-compose.yml文件: $DDNS_COMPOSE_DIR"
+has_global_ipv6() {
+    local iface="$1"
+    # 逻辑：
+    # 1. 显示指定接口的 IPv6 地址
+    # 2. 筛选包含 'inet6' 和 'scope global' 的行
+    # 3. 排除包含 'deprecated' 的行 (这是关键修正)
+    # 4. 排除包含 'tentative' 的行 (还在地址冲突检测中，不可用)
+    if ip -6 addr show dev "$iface" 2>/dev/null | grep 'inet6' | grep 'scope global' | grep -v 'deprecated' | grep -v 'tentative' | grep -q 'inet6'; then
+        return 0
+    else
+        return 1
     fi
-    log_info "初始化检查完成，PID: $$"
 }
 
-# ==================== 网络状态检查 ====================
-has_global_ipv6() { ip -6 addr show "$1" 2>/dev/null | grep -q 'inet6.*scope global'; }
 check_ipv6_connectivity() {
-    local test_hosts=("2606:4700:4700::1111" "2001:4860:4860::8888")
-    for host in "${test_hosts[@]}"; do if ping6 -c1 -W3 "$host" >/dev/null 2>&1; then return 0; fi; done
+    # 优先测试阿里DNS，备用谷歌DNS
+    local test_hosts=("$TEST_IPV6_ADDR" "2001:4860:4860::8888")
+    for host in "${test_hosts[@]}"; do
+        if ping6 -c 1 -W 5 "$host" >/dev/null 2>&1; then return 0; fi
+    done
     return 1
 }
 
-# ==================== 代理URL构建 (已修复) ====================
-build_proxy_url() {
-    case "$PROXY_TYPE" in
-        http|https) echo "$PROXY_TYPE://$PROXY_HOST:$PROXY_PORT" ;;
-        # 注意：这里我们只构建基础URL，代理类型特定参数在build_curl_args中处理
-        socks5) echo "socks5h://$PROXY_HOST:$PROXY_PORT" ;;
-        *) log_error "不支持的代理类型: $PROXY_TYPE"; exit 1 ;;
-    esac
-}
+# Curl 封装
+perform_curl() {
+    local url="$1"
+    local use_proxy="$2"
+    local args=("--connect-timeout" "$CHECK_TIMEOUT" "--max-time" "$((CHECK_TIMEOUT+5))" "-s" "-o" "/dev/null" "-w" "%{http_code}")
 
-build_curl_args() {
-    local proxy_url
-    proxy_url=$(build_proxy_url)
-    # 使用socks5h协议方案，它等同于 --socks5-hostname
-    # 这是一种更现代、兼容性更好的方式，让代理服务器执行DNS解析
-    local args=(
-        "--proxy" "$proxy_url" "--connect-timeout" "$CHECK_TIMEOUT"
-        "--max-time" "$((CHECK_TIMEOUT * 2))" "--user-agent" "CloudflareMonitor/2.2"
-        "--fail" "--silent" "--show-error" "-o" "/dev/null" "-w" "%{http_code}"
-    )
-    printf '%s\n' "${args[@]}"
-}
-
-# ==================== 域名访问检测 ====================
-check_domain_accessibility() {
-    local retry_count=0
-    log_info "开始检测域名访问: $CHECK_URL"
-    while [[ $retry_count -lt $MAX_RETRY_COUNT ]]; do
-        ((retry_count++)); log_info "第 $retry_count 次检测尝试"
-        local curl_args; mapfile -t curl_args < <(build_curl_args)
-        local http_code curl_exit_code
-        if http_code=$(curl "${curl_args[@]}" "$CHECK_URL" 2>&1); then
-            curl_exit_code=0
-        else
-            curl_exit_code=$?
-        fi
-        log_info "Curl退出码: $curl_exit_code, HTTP状态码: $http_code"
-        if [[ $curl_exit_code -eq 0 ]] && [[ "$http_code" =~ ^[23][0-9][0-9]$ ]]; then
-            log_success "域名访问正常 (HTTP $http_code)"; CONSECUTIVE_FAILURES=0; CURRENT_BACKOFF_INTERVAL=$CHECK_INTERVAL; return 0
-        fi
-        log_warn "访问失败 - 退出码: $curl_exit_code, HTTP: $http_code"
-        if [[ $retry_count -lt $MAX_RETRY_COUNT ]]; then log_info "等待10秒后重试..."; sleep 10; fi
-    done
-    log_error "经过 $MAX_RETRY_COUNT 次尝试，域名仍无法访问"; ((CONSECUTIVE_FAILURES++)); calculate_backoff_interval; return 1
-}
-
-# ==================== 指数退避 ====================
-calculate_backoff_interval() {
-    if [[ "$ENABLE_EXPONENTIAL_BACKOFF" != "true" ]]; then return; fi
-    local backoff_multiplier=$((2 ** (CONSECUTIVE_FAILURES - 1)))
-    CURRENT_BACKOFF_INTERVAL=$((CHECK_INTERVAL * backoff_multiplier))
-    if [[ $CURRENT_BACKOFF_INTERVAL -gt $MAX_BACKOFF_INTERVAL ]]; then CURRENT_BACKOFF_INTERVAL=$MAX_BACKOFF_INTERVAL; fi
-    log_info "连续失败 $CONSECUTIVE_FAILURES 次，下次检测间隔: ${CURRENT_BACKOFF_INTERVAL}秒"
-}
-
-# ==================== 网络重启与DDNS触发 (已更新) ====================
-trigger_ddns_restart() {
-    if [[ "$ENABLE_DDNS_RESTART" != "true" ]]; then
-        log_info "DDNS重启被禁用，跳过此步骤"
-        return
+    if [[ "$use_proxy" == "true" ]] && [[ "$ENABLE_PROXY" == "true" ]]; then
+        local proxy_url
+        if [[ "$PROXY_TYPE" == "socks5" ]]; then proxy_url="socks5h://$PROXY_HOST:$PROXY_PORT"
+        else proxy_url="$PROXY_TYPE://$PROXY_HOST:$PROXY_PORT"; fi
+        args+=("--proxy" "$proxy_url")
+    else
+        args+=("--noproxy" "*")
     fi
-    log_info "开始触发DDNS更新..."
-    if ! cd "$DDNS_COMPOSE_DIR"; then
-        log_error "无法进入DDNS目录: $DDNS_COMPOSE_DIR"
-        return 1
-    fi
-    if ! docker-compose restart "$DDNS_COMPOSE_SERVICE"; then
-        log_error "重启DDNS服务失败: $DDNS_COMPOSE_SERVICE"
-        # 返回脚本原目录
-        cd - > /dev/null
-        return 1
-    fi
-    log_success "DDNS服务 ($DDNS_COMPOSE_SERVICE) 重启指令已发送"
-    # 最后强制重启所有 docker 容器
-    systemctl restart docker
-    # 返回脚本原目录
-    cd - > /dev/null
+
+    local code
+    code=$(timeout "$((CHECK_TIMEOUT+10))" curl "${args[@]}" "$url" 2>&1 || echo "000")
+    [[ "$code" =~ ^[23][0-9][0-9]$ ]] && return 0 || return 1
 }
 
+# 重启 Docker 服务 (源站不通时调用)
+restart_docker_daemon() {
+    log_warn "源站服务检测失败，判定为 Docker 服务异常，正在重启 Docker..."
+    if systemctl restart docker; then
+        log_success "Docker 服务已重启，脚本退出，等待下个周期检测。"
+    else
+        log_error "Docker 服务重启失败，请人工介入。"
+    fi
+    exit 0 # 重启 Docker 动静较大，重启后直接结束本次任务
+}
+
+# ==================== 网络重启逻辑 (核心保持不变) ====================
 restart_by_truenas() {
     log_info "使用TrueNAS API方法重启接口: $NETWORK_INTERFACE"
     local interface_id
@@ -220,14 +136,31 @@ restart_by_truenas() {
     if [[ -z "$interface_id" ]] || [[ "$interface_id" == "null" ]]; then log_error "无法找到接口 $NETWORK_INTERFACE 的ID"; return 1; fi
     log_info "找到接口ID: $interface_id"
 
-    log_info "步骤 1/3: 禁用IPv6自动配置"; midclt call interface.update "$interface_id" '{"ipv6_auto": false}'
-    log_info "步骤 2/3: 提交网络更改"; midclt call interface.commit '{"checkin_timeout": 60}' > /dev/null
-    log_info "步骤 3/3: 确认网络更改"; midclt call interface.checkin
-    log_info "已禁用IPv6自动配置，等待5秒以确保状态刷新"; sleep 5
+    # 1. 先禁用，清理旧状态
+    log_info "步骤 1/4: 禁用IPv4/IPv6自动配置"
+    midclt call interface.update "$interface_id" '{"ipv4_dhcp": false, "ipv6_auto": false}'
+    midclt call interface.commit '{"checkin_timeout": 60}' > /dev/null
+    midclt call interface.checkin
 
-    log_info "步骤 1/3: 重新启用IPv6自动配置"; midclt call interface.update "$interface_id" '{"ipv6_auto": true}'
-    log_info "步骤 2/3: 提交网络更改"; midclt call interface.commit '{"checkin_timeout": 60}' > /dev/null
-    log_info "步骤 3/3: 确认网络更改"; midclt call interface.checkin
+    # 2. 【关键修改】在启用新配置之前，强制重置物理接口状态
+    #    这样既能触发 IPv6 的底层状态刷新，又不会杀死即将启动的 IPv4 DHCP 进程
+    log_info "步骤 2/4: 强制物理接口重置 (Down/Up)"
+    ip link set "$interface_id" down
+    sleep 3 # 给内核一点时间处理清理工作
+    ip link set "$interface_id" up
+    sleep 5 # 等待链路协商完成 (Link Up)
+
+    # 3. 启用配置
+    log_info "步骤 3/4: 重新启用IPv4/IPv6自动配置"
+    midclt call interface.update "$interface_id" '{"ipv4_dhcp": true, "ipv6_auto": true}'
+
+    # 4. 提交更改
+    #    TrueNAS 此时会检测到接口已 UP，并启动 DHCP Client 和应用 IPv6 设置
+    log_info "步骤 4/4: 提交并应用网络更改"
+    midclt call interface.commit '{"checkin_timeout": 60}' > /dev/null
+    midclt call interface.checkin
+
+    log_info "网络重启完成，等待地址获取..."
 }
 
 restart_by_systemd() { log_info "重启systemd-networkd服务"; systemctl restart systemd-networkd; }
@@ -235,6 +168,23 @@ restart_by_raw() { log_info "使用ip命令重启接口: $NETWORK_INTERFACE"; ip
 restart_by_dhclient() {
     log_info "重启DHCPv6客户端"; dhclient -6 -r "$NETWORK_INTERFACE" >/dev/null 2>&1 || true; sleep 2; dhclient -6 "$NETWORK_INTERFACE" >/dev/null 2>&1; sleep 3
     if ! has_global_ipv6 "$NETWORK_INTERFACE"; then restart_by_raw; fi
+}
+
+wait_ipv6_ready() {
+    local deadline=$((SECONDS + RECOVERY_WAIT_TIME))
+    log_info "等待IPv6网络恢复，最长 ${RECOVERY_WAIT_TIME}秒"
+    while ((SECONDS < deadline)); do
+        # 这里的 has_global_ipv6 已经包含了对 deprecated 的过滤
+        if has_global_ipv6 "$NETWORK_INTERFACE"; then
+            log_info "检测到有效IPv6地址，测试外网连接..."
+            if check_ipv6_connectivity; then
+                log_success "IPv6网络完全恢复"; log_info "恢复后网络状态:"; ip -6 addr show "$NETWORK_INTERFACE" | grep inet6 | while IFS= read -r line; do log_info "  $line"; done
+                return 0
+            fi
+        fi
+        sleep 5
+    done
+    log_error "超时: ${RECOVERY_WAIT_TIME}秒内IPv6网络未完全恢复"; return 1
 }
 
 restart_ipv6_network() {
@@ -249,97 +199,73 @@ restart_ipv6_network() {
 
     if wait_ipv6_ready; then
         log_success "IPv6网络重启成功"
-        trigger_ddns_restart # 在网络恢复后触发DDNS
+        log_info "重启所有容器服务"
+        systemctl restart docker
+        log_success "重启所有容器服务成功"
         return 0
     else
         log_error "IPv6网络重启失败"; return 1
     fi
 }
 
-wait_ipv6_ready() {
-    local deadline=$((SECONDS + RECOVERY_WAIT_TIME))
-    log_info "等待IPv6网络恢复，最长 ${RECOVERY_WAIT_TIME}秒"
-    while ((SECONDS < deadline)); do
-        if has_global_ipv6 "$NETWORK_INTERFACE"; then
-            log_info "检测到IPv6地址，测试外网连接..."
-            if check_ipv6_connectivity; then
-                log_success "IPv6网络完全恢复"; log_info "恢复后网络状态:"; ip -6 addr show "$NETWORK_INTERFACE" | grep inet6 | while IFS= read -r line; do log_info "  $line"; done
-                return 0
+# ==================== 主逻辑 ====================
+main() {
+    acquire_lock
+
+    if [[ $EUID -ne 0 ]]; then
+        log_error "Please run as root."
+        exit 1
+    fi
+
+    # 1. 检查 IPv4 宽带连接 (基础物理层/光猫)
+    if ! perform_curl "$TEST_IPV4_URL" "false"; then
+        log_error "IPv4 公网连接异常 ($TEST_IPV4_URL)，中止任务。"
+        exit 1
+    fi
+
+    # 2. 检查 IPv6 宽带连接 (运营商IPv6网络)
+    if ! check_ipv6_connectivity; then
+         log_error "IPv6 公网连接异常 (Ping $TEST_IPV6_ADDR 失败)，可能是运营商问题，中止任务。"
+         exit 1
+    fi
+
+    # 3. 检查本地源站 (Docker 状态)
+    if [[ -n "$LOCAL_SOURCE_URL" ]]; then
+        local local_retry=0
+        local local_ok=false
+        while [[ $local_retry -lt 3 ]]; do
+            if perform_curl "$LOCAL_SOURCE_URL" "false"; then
+                local_ok=true
+                break
             fi
-        fi
-        sleep 5
-    done
-    log_error "超时: ${RECOVERY_WAIT_TIME}秒内IPv6网络未完全恢复"; return 1
-}
+            ((local_retry++))
+            sleep 2
+        done
 
-# ==================== 自检功能 ====================
-self_check() {
-    echo "=== Cloudflare Monitor 自检 ==="; echo "配置检查:"; echo "  域名: $DOMAIN"; echo "  检测URL: $CHECK_URL"; echo "  代理: $PROXY_TYPE://$PROXY_HOST:$PROXY_PORT"; echo "  网络接口: $NETWORK_INTERFACE"; echo "  重启方式: $RESTART_METHOD"; echo
-    echo "网络状态:"; if has_global_ipv6 "$NETWORK_INTERFACE"; then echo "  ✓ IPv6地址: $(ip -6 addr show "$NETWORK_INTERFACE" | grep 'inet6.*global' | awk '{print $2}' | head -1)"; else echo "  ✗ 无IPv6地址"; fi
-    if check_ipv6_connectivity; then echo "  ✓ IPv6外网连通"; else echo "  ✗ IPv6外网不通"; fi
-    echo; echo "域名检查:"; if check_domain_accessibility; then echo "  ✓ 域名访问正常"; else echo "  ✗ 域名访问失败"; fi
-}
-
-# ==================== 主循环 ====================
-main_check() {
-    log_info "========== 开始单次检测和修复任务 =========="
-    if check_domain_accessibility; then
-        log_success "检测通过，任务正常结束。"
-    else
-        log_error "域名访问异常，执行网络修复..."
-        if restart_ipv6_network; then
-            log_success "网络修复成功。"
-        else
-            log_error "网络修复失败。"
+        if [[ "$local_ok" == "false" ]]; then
+            log_error "本地源站无法访问 ($LOCAL_SOURCE_URL)，网络正常但服务不可达。"
+            restart_docker_daemon
         fi
     fi
-    log_info "================ 任务结束 ================"
+
+    # 4. 检查目标域名 (最终端到端测试)
+    local target_ok=false
+    for ((i=1; i<=MAX_RETRY_COUNT; i++)); do
+        if perform_curl "$CHECK_URL" "true"; then
+            target_ok=true
+            log_success "目标域名访问正常"
+            break
+        else
+            log_warn "目标访问失败 ($i/$MAX_RETRY_COUNT): $CHECK_URL"
+            if [[ $i -lt $MAX_RETRY_COUNT ]]; then sleep 10; fi
+        fi
+    done
+
+    # 5. 判定修复
+    if [[ "$target_ok" == "false" ]]; then
+        log_error "故障判定: [宽带IPv4/v6正常] + [源站正常] + [目标不可达]。执行网络重置。"
+        restart_ipv6_network
+    fi
 }
 
-# ==================== 清理功能 ====================
-cleanup() { log_info "收到退出信号，清理资源"; log_info "脚本退出"; exit 0; }
-
-# ==================== 主函数 (已更新) ====================
-show_help() {
-    cat << EOF
-用法: $0 [选项]
-
-此脚本用于监控通过特定代理的域名访问，并在失败时尝试通过重启网络来恢复。
-特别优化了对TrueNAS SCALE系统的支持，并能在恢复后触发DDNS更新。
-
-选项:
-  --check       执行一次检查并退出
-  --restart     强制重启网络并退出
-  --self-check  显示配置和状态信息
-  --help        显示此帮助信息
-
-环境变量:
-  DOMAIN                目标域名
-  PROXY_HOST           代理主机
-  PROXY_PORT           代理端口
-  NETWORK_INTERFACE    网络接口名 (默认: br0)
-  RESTART_METHOD       重启方式(truenas|systemd-networkd|raw|dhclient) (默认: truenas)
-  ENABLE_DDNS_RESTART  是否重启DDNS (true|false, 默认: true)
-  DDNS_COMPOSE_DIR     DDNS docker-compose.yml 所在目录
-
-配置文件: $CONFIG_FILE
-EOF
-}
-
-main() {
-    load_config
-    case "${1:-}" in
-        --help|-h) show_help; exit 0 ;;
-        --self-check) init_check; self_check; exit 0 ;;
-        --check) init_check; check_domain_accessibility; exit $? ;;
-        --restart) init_check; restart_ipv6_network; exit $? ;;
-        *) # 任何其他情况，包括不带参数，都执行主任务
-            acquire_lock
-            init_check
-            main_check
-            ;;
-    esac
-}
-
-# 执行主函数
 main "$@"
